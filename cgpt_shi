@@ -1,0 +1,67 @@
+You’re on the right track, but just calling winget install Microsoft.DesktopAppInstaller isn’t reliable on older or stripped-down Windows 10 systems—especially if the Microsoft Store stack or dependencies are missing. You need a fallback that installs the full APPX/MSIX bundle with dependencies manually.
+Here’s how to extend your script cleanly.
+
+🔧 What you’re adding
+If App Installer is missing, the script will:
+
+
+Try winget (your current logic)
+
+
+If that fails → download:
+
+
+App Installer .msixbundle
+
+
+Required dependencies (VCLibs, UI.Xaml)
+
+
+
+
+Install them using Add-AppxPackage
+
+
+
+✅ Drop-in Replacement Function
+Replace your current Test-AppInstaller block with this:
+function Install-AppInstallerFull {    Write-Host "[INFO] Attempting full App Installer deployment..."    $Temp = Join-Path $env:TEMP "AppInstallerSetup"    if (-not (Test-Path $Temp)) {        New-Item -ItemType Directory -Path $Temp | Out-Null    }    # URLs (official Microsoft CDN)    $VCLibs = "https://aka.ms/Microsoft.VCLibs.x64.14.00.Desktop.appx"    $Xaml = "https://github.com/microsoft/microsoft-ui-xaml/releases/latest/download/Microsoft.UI.Xaml.2.8.x64.appx"    $AppInstaller = "https://aka.ms/getwinget"    $VCLibsPath = Join-Path $Temp "VCLibs.appx"    $XamlPath = Join-Path $Temp "UI.Xaml.appx"    $AppInstallerPath = Join-Path $Temp "AppInstaller.msixbundle"    try {        Write-Host "[+] Downloading dependencies..."        Invoke-WebRequest $VCLibs -OutFile $VCLibsPath        Invoke-WebRequest $Xaml -OutFile $XamlPath        Invoke-WebRequest $AppInstaller -OutFile $AppInstallerPath        Write-Host "[+] Installing dependencies..."        Add-AppxPackage -Path $VCLibsPath -ErrorAction Stop        Add-AppxPackage -Path $XamlPath -ErrorAction Stop        Write-Host "[+] Installing App Installer..."        Add-AppxPackage -Path $AppInstallerPath -ErrorAction Stop        Write-Host "[OK] App Installer successfully installed."        return $true    }    catch {        Write-Host "[ERROR] Full installation failed: $_"        return $false    }}
+
+🔁 Update Your Existing Logic
+Replace this section:
+if (-not (Test-AppInstaller) -and $WindowsVersion -eq "10") {
+with:
+if (-not (Test-AppInstaller)) {    Write-Host "[INFO] Windows App Installer not found."    # First attempt: winget (if somehow available)    if (Test-Command "winget") {        try {            winget install --id Microsoft.DesktopAppInstaller -e --silent        }        catch {}    }    # Re-check    if (-not (Test-AppInstaller)) {        Write-Host "[INFO] Falling back to manual APPX installation..."                if (-not (Install-AppInstallerFull)) {            Write-Host "[FATAL] Could not install App Installer."            Stop-Transcript | Out-Null            return        }    }}
+
+⚠️ Important Notes
+
+
+Add-AppxPackage requires admin privileges → your script should be run elevated.
+
+
+Some Windows 10 LTSC builds lack Store framework support → this method still works in most cases, but not all.
+
+
+The aka.ms/getwinget link always points to the latest official bundle (good choice 👍).
+
+
+
+💡 Optional (Nice Upgrade)
+You could add:
+# Ensure TLS 1.2 for downloads[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+This avoids download failures on older systems.
+
+Bottom line
+With this addition, your script becomes self-sufficient:
+
+
+Works on clean Windows installs
+
+
+Works without Microsoft Store
+
+
+Handles dependencies automatically
+
+
+If you want, I can help you turn this into a fully modular installer framework (so you can plug in other MSIX packages the same way).
