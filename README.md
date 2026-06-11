@@ -1,5 +1,7 @@
 # WinPatcher
 
+# needs execution policy changed
+
 ## Overview
 This PowerShell script is designed to automate **system package upgrades** using `winget` and capture a **network configuration snapshot** for logging purposes. It provides a clean interface for monitoring progress and saving logs.
 
