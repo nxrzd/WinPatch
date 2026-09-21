@@ -68,3 +68,24 @@ The default recommended maximum uptime is:
 
 ```text
 12 hours
+
+## License
+
+WinPatcher is released under the **WinPatcher Attribution License v1.0**.
+
+You are free to:
+
+- Use WinPatcher personally or commercially
+- Modify the source code
+- Redistribute the original software
+- Redistribute modified versions
+- Incorporate WinPatcher into larger projects
+
+**Attribution is required for redistribution.**
+
+Redistributed copies and substantial portions of the software must retain:
+
+> WinPatcher by nxrzd  
+> https://github.com/nxrzd
+
+See the [`LICENSE`](LICENSE) file for the complete license terms.
