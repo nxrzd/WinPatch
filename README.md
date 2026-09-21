@@ -1,4 +1,4 @@
-# WinPatcher
+# WinPatch
 
 **WinPatcher v2.4** is a PowerShell-based Windows maintenance utility that performs system checks, repairs and updates WinGet when necessary, refreshes WinGet sources, upgrades installed packages, and creates diagnostic logs.
 
