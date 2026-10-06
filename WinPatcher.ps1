@@ -1,1062 +1,1217 @@
-#Requires -Version 5.1
+#requires -RunAsAdministrator
 
-# =========================================
-# WinPatcher v2.4
-# Author: https://github.com/nxrzd
-# License: MIT
-#
-# Features:
-# - Administrator elevation
-# - Windows version detection
-# - System uptime warning
-# - Pending reboot detection
-# - WinGet detection and repair
-# - WinGet source update
-# - Full WinGet package upgrade
-# - Network configuration snapshot
-# - Optional RDP redirected-drive export
-# - Structured application logging
-# - PowerShell transcript logging
-# - Console UI / startup banner
-#
-# Notes:
-# - Windows Terminal is NOT required by WinPatcher.
-# - Network configuration is captured once.
-# - Network logs remain local unless RDP export is enabled.
-# =========================================
+<#
+.SYNOPSIS
+    Verbose, interactive Windows Update installer.
+
+.DESCRIPTION
+    Searches Windows Update and displays:
+
+        Required Updates
+        Optional Updates
+        Drivers
+
+    Required updates are selected by default.
+
+    Use -Include-Optional to also select optional updates
+    and drivers.
+
+    Use -Auto-Reboot to automatically restart Windows when
+    a reboot is required by this update operation.
+
+    Existing pending reboots do NOT automatically trigger
+    a reboot before searching for updates.
+
+.PARAMETER Include_Optional
+    Includes optional updates and driver updates.
+
+.PARAMETER Auto_Reboot
+    Automatically restarts Windows when the update operation
+    requires a reboot.
+
+.EXAMPLES
+
+    Required updates only:
+        .\Windows_Update_2.1.ps1
+
+    Required + optional + drivers:
+        .\Windows_Update_2.1.ps1 -Include-Optional
+
+    Required + optional + drivers + automatic reboot:
+        .\Windows_Update_2.1.ps1 -Include-Optional -Auto-Reboot
+
+.EXIT CODES
+
+    0     Success
+    1     Not Administrator
+    2     Windows Update initialization failure
+    3     Windows Update search failure
+    10    User cancelled
+    20    Download operation failure
+    21    No selected updates downloaded successfully
+    30    Installation operation failure
+    40    One or more updates failed or could not be downloaded
+    3010  Success, reboot required
+#>
+
+[CmdletBinding()]
+param(
+    [switch]$Include_Optional,
+
+    [switch]$Auto_Reboot
+)
 
 $ErrorActionPreference = "Stop"
 
-# =========================================
-# CONFIGURATION
-# =========================================
+# ============================================================
+# DISPLAY FUNCTIONS
+# ============================================================
 
-$MaxRecommendedUptimeHours = 12
-
-# RDP export:
-#
-# Leave empty to automatically look for an available
-# RDP redirected drive under \\tsclient\.
-#
-# Example explicit path:
-# \\tsclient\C\WinPatcher
-#
-# The destination must be an RDP redirected/shared
-# location that is already available to this session.
-#
-$RdpExportPath = ""
-
-# Set to $false if you do not want automatic RDP export.
-$RdpExportEnabled = $true
-
-
-# =========================================
-# PATHS
-# =========================================
-
-$LogDirectory = Join-Path `
-    $env:ProgramData `
-    "WinPatcher"
-
-$NetworkLogDirectory = Join-Path `
-    $LogDirectory `
-    "NetworkLogs"
-
-$TimeStamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
-
-$LogFile = Join-Path `
-    $LogDirectory `
-("WinPatcher_" + $TimeStamp + ".log")
-
-$NetworkLogFile = Join-Path `
-    $NetworkLogDirectory `
-("IPConfig_" + $TimeStamp + ".txt")
-
-$TranscriptFile = Join-Path `
-    $LogDirectory `
-("Transcript_" + $TimeStamp + ".txt")
-
-
-# =========================================
-# STATE
-# =========================================
-
-$transcriptStarted = $false
-
-
-# =========================================
-# FUNCTIONS
-# =========================================
-
-function Write-Log {
-
+function Write-Step {
     param(
-        [string]$Message,
-        [string]$Level = "INFO"
+        [Parameter(Mandatory)]
+        [string]$Message
     )
 
-    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    Write-Host ""
+    Write-Host "[$(Get-Date -Format 'HH:mm:ss')] " `
+        -NoNewline `
+        -ForegroundColor DarkGray
 
-    $line = "[$timestamp] [$Level] $Message"
+    Write-Host $Message -ForegroundColor Cyan
+}
 
-    switch ($Level) {
+function Write-Info {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Message
+    )
 
-        "ERROR" {
-            Write-Host $line -ForegroundColor Red
-        }
+    Write-Host "    $Message" -ForegroundColor Gray
+}
 
-        "WARN" {
-            Write-Host $line -ForegroundColor Yellow
-        }
+function Write-Success {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Message
+    )
 
-        "SUCCESS" {
-            Write-Host $line -ForegroundColor Green
-        }
+    Write-Host "    $Message" -ForegroundColor Green
+}
 
-        default {
-            Write-Host $line
-        }
-    }
+function Write-WarningMessage {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Message
+    )
 
-    try {
+    Write-Host "    $Message" -ForegroundColor Yellow
+}
 
-        if (-not (Test-Path $LogDirectory)) {
+function Write-Failure {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Message
+    )
 
-            New-Item `
-                -ItemType Directory `
-                -Path $LogDirectory `
-                -Force | Out-Null
-        }
+    Write-Host "    $Message" -ForegroundColor Red
+}
 
-        Add-Content `
-            -Path $LogFile `
-            -Value $line `
-            -ErrorAction Stop
-    }
-    catch {
+function Write-UpdateEntry {
+    param(
+        [Parameter(Mandatory)]
+        $Update
+    )
 
-        Write-Host `
-            "[WARNING] Unable to write application log: $($_.Exception.Message)" `
+    $kb = Get-KB $Update
+    $size = Get-SizeMB $Update
+
+    Write-Host "  ● " `
+        -NoNewline `
+        -ForegroundColor Yellow
+
+    if ($kb) {
+        Write-Host "$kb " `
+            -NoNewline `
             -ForegroundColor Yellow
     }
+
+    Write-Host $Update.Title -ForegroundColor White
+
+    if ($size -gt 0) {
+        Write-Host "      Size: $size MB" `
+            -ForegroundColor DarkGray
+    }
 }
 
+# ============================================================
+# UPDATE HELPERS
+# ============================================================
 
-function Wait-AndExit {
-
+function Get-KB {
     param(
-        [string]$Message = "Press ENTER to close..."
+        [Parameter(Mandatory)]
+        $Update
     )
 
-    Write-Host ""
-    Read-Host $Message
-    exit
-}
-
-
-function Show-Banner {
-
-    Clear-Host
-
-    Write-Host @'
- __      __.__      __________         __         .__
-/  \    /  \__| ____\______   \_____ _/  |_  ____ |  |__   ___________
-\   \/\/   /  |/    \|     ___/\__  \\   __\/ ___\|  |  \_/ __ \_  __ \
- \        /|  |   |  \    |     / __ \|  | \  \___|   Y  \  ___/|  | \/
-  \__/\  / |__|___|  /____|    (____  /__|  \___  >___|  /\___  >__|
-       \/          \/               \/          \/     \/     \/
-'@
-
-    Write-Host ""
-    Write-Host "============================================================"
-    Write-Host "                 WINPATCHER v2.4"
-    Write-Host "============================================================"
-    Write-Host ""
-    Write-Host "        Windows Maintenance & Package Updater"
-    Write-Host ""
-    Write-Host "  Press ENTER to initiate system sequence..."
-    Write-Host ""
-}
-
-
-function Set-ConsoleUI {
-
     try {
+        if ($null -ne $Update.KBArticleIDs -and
+            $Update.KBArticleIDs.Count -gt 0) {
 
-        $Host.UI.RawUI.BackgroundColor = "Black"
-        $Host.UI.RawUI.ForegroundColor = "Green"
-
-        Clear-Host
+            return "KB$($Update.KBArticleIDs.Item(0))"
+        }
     }
     catch {
-        # Some hosts do not expose RawUI properties.
+        # Some updates do not expose KBArticleIDs.
     }
+
+    return ""
 }
 
-
-function Ensure-Administrator {
-
-    $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
-
-    $principal = New-Object `
-        Security.Principal.WindowsPrincipal($currentIdentity)
-
-    $isAdmin = $principal.IsInRole(
-        [Security.Principal.WindowsBuiltInRole]::Administrator
+function Get-SizeMB {
+    param(
+        [Parameter(Mandatory)]
+        $Update
     )
 
-    if (-not $isAdmin) {
-
-        Write-Host ""
-        Write-Host `
-            "[INFO] Requesting Administrator privileges..." `
-            -ForegroundColor Yellow
-
-        $scriptPath = $PSCommandPath
-
-        if (-not $scriptPath) {
-
-            $scriptPath = $MyInvocation.PSCommandPath
-        }
-
-        if (-not $scriptPath) {
-
-            Write-Host ""
-            Write-Host `
-                "Unable to determine script path." `
-                -ForegroundColor Red
-
-            Wait-AndExit
-        }
-
-        $arguments = @(
-            "-NoProfile"
-            "-ExecutionPolicy"
-            "Bypass"
-            "-File"
-            "`"$scriptPath`""
-        )
-
-        Start-Process `
-            -FilePath "powershell.exe" `
-            -Verb RunAs `
-            -ArgumentList $arguments
-
-        exit
-    }
-}
-
-
-function Get-WindowsVersion {
-
     try {
+        if ($Update.MaxDownloadSize -gt 0) {
 
-        $os = Get-CimInstance Win32_OperatingSystem
-
-        $build = [int]$os.BuildNumber
-
-        if ($build -ge 22000) {
-
-            return "Windows 11"
-        }
-
-        return "Windows 10"
-    }
-    catch {
-
-        return "Unknown Windows Version"
-    }
-}
-
-
-function Check-Uptime {
-
-    try {
-
-        $lastBoot = (
-            Get-CimInstance Win32_OperatingSystem
-        ).LastBootUpTime
-
-        $uptime = (Get-Date) - $lastBoot
-
-        $uptimeHours = [math]::Round(
-            $uptime.TotalHours,
-            1
-        )
-
-        Write-Log "System uptime: $uptimeHours hours"
-
-        if ($uptimeHours -gt $MaxRecommendedUptimeHours) {
-
-            Write-Host ""
-            Write-Host `
-                "WARNING: System uptime exceeds $MaxRecommendedUptimeHours hours." `
-                -ForegroundColor Yellow
-
-            Write-Host `
-                "A restart is recommended before patching." `
-                -ForegroundColor Yellow
-
-            Write-Host ""
-
-            $choice = Read-Host "Continue anyway? (Y/N)"
-
-            if ($choice -notmatch '^[Yy]$') {
-
-                Write-Log `
-                    "User cancelled due to uptime warning." `
-                    "WARN"
-
-                Wait-AndExit
-            }
+            return [math]::Round(
+                $Update.MaxDownloadSize / 1MB,
+                1
+            )
         }
     }
     catch {
-
-        Write-Log `
-            "Failed to determine uptime: $_" `
-            "ERROR"
+        # Some updates do not expose download size.
     }
+
+    return 0
 }
 
-
-function Test-PendingReboot {
-
-    Write-Log "Checking for pending reboot status..."
-
-    try {
-
-        $pendingReasons = @()
-
-        # Windows Update reboot requirement
-        $windowsUpdateReboot = Test-Path `
-            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired"
-
-        if ($windowsUpdateReboot) {
-
-            $pendingReasons += "Windows Update"
-        }
-
-
-        # Component Based Servicing
-        $cbsReboot = Test-Path `
-            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending"
-
-        if ($cbsReboot) {
-
-            $pendingReasons += "Component Based Servicing"
-        }
-
-
-        # Pending file rename operations
-        $sessionManagerPath = `
-            "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager"
-
-        $pendingFileRename = Get-ItemProperty `
-            -Path $sessionManagerPath `
-            -Name "PendingFileRenameOperations" `
-            -ErrorAction SilentlyContinue
-
-        if ($pendingFileRename) {
-
-            $pendingReasons += "Pending file operations"
-        }
-
-
-        if ($pendingReasons.Count -gt 0) {
-
-            $reasonText = $pendingReasons -join ", "
-
-            Write-Log `
-                "A system reboot appears to be pending: $reasonText" `
-                "WARN"
-
-            Write-Host ""
-            Write-Host `
-                "WARNING: Windows indicates that a reboot is pending." `
-                -ForegroundColor Yellow
-
-            Write-Host `
-                "Detected: $reasonText" `
-                -ForegroundColor Yellow
-
-            Write-Host ""
-            Write-Host `
-                "A restart may be advisable before continuing." `
-                -ForegroundColor Yellow
-
-            Write-Host ""
-
-            $choice = Read-Host "Continue patching anyway? (Y/N)"
-
-            if ($choice -notmatch '^[Yy]$') {
-
-                Write-Log `
-                    "User cancelled because a reboot was pending." `
-                    "WARN"
-
-                Wait-AndExit
-            }
-
-            Write-Log `
-                "User chose to continue despite pending reboot." `
-                "WARN"
-        }
-        else {
-
-            Write-Log `
-                "No pending reboot indicators detected." `
-                "SUCCESS"
-        }
-    }
-    catch {
-
-        Write-Log `
-            "Unable to determine pending reboot status: $_" `
-            "WARN"
-    }
-}
-
-
-function Capture-NetworkConfiguration {
-
-    Write-Log "Capturing network configuration..."
+function Test-DriverUpdate {
+    param(
+        [Parameter(Mandatory)]
+        $Update
+    )
 
     try {
+        # Windows Update Agent:
+        # 1 = Software
+        # 2 = Driver
 
-        if (-not (Test-Path $NetworkLogDirectory)) {
-
-            New-Item `
-                -ItemType Directory `
-                -Path $NetworkLogDirectory `
-                -Force | Out-Null
-        }
-
-        $header = @"
-============================================================
- NETWORK CONFIGURATION SNAPSHOT
-============================================================
-
-Date: $(Get-Date)
-Machine: $env:COMPUTERNAME
-User: $env:USERNAME
-OS: $(Get-WindowsVersion)
-
-============================================================
-
-"@
-
-        # Capture ONCE.
-        $networkOutput = ipconfig /all
-
-        # Write the complete snapshot to the dedicated
-        # network log only.
-        $header |
-        Out-File `
-            -FilePath $NetworkLogFile `
-            -Encoding UTF8
-
-        $networkOutput |
-        Out-File `
-            -FilePath $NetworkLogFile `
-            -Append `
-            -Encoding UTF8
-
-        Write-Log `
-            "Network configuration saved to: $NetworkLogFile" `
-            "SUCCESS"
-
-        return $true
+        return ([int]$Update.Type -eq 2)
     }
     catch {
-
-        Write-Log `
-            "Failed to capture network configuration: $_" `
-            "ERROR"
-
         return $false
     }
 }
 
-
-function Find-RdpRedirectedPath {
-
-    if (-not $RdpExportEnabled) {
-
-        return $null
-    }
-
-    # If explicitly configured, use that.
-    if (-not [string]::IsNullOrWhiteSpace($RdpExportPath)) {
-
-        if (Test-Path $RdpExportPath) {
-
-            return $RdpExportPath
-        }
-
-        Write-Log `
-            "Configured RDP export path is unavailable: $RdpExportPath" `
-            "WARN"
-
-        return $null
-    }
-
-
-    # Automatically look for RDP client redirected drives.
-    $tsClientRoot = "\\tsclient"
-
-    if (-not (Test-Path $tsClientRoot)) {
-
-        Write-Log `
-            "No RDP redirected drives detected." `
-            "WARN"
-
-        return $null
-    }
-
-    try {
-
-        $redirectedDrives = Get-ChildItem `
-            -Path $tsClientRoot `
-            -Directory `
-            -ErrorAction Stop
-
-        foreach ($drive in $redirectedDrives) {
-
-            $candidate = $drive.FullName
-
-            if (Test-Path $candidate) {
-
-                return $candidate
-            }
-        }
-    }
-    catch {
-
-        Write-Log `
-            "Unable to enumerate RDP redirected drives: $_" `
-            "WARN"
-    }
-
-    return $null
-}
-
-
-function Export-NetworkLogToRdp {
-
+function Test-OptionalUpdate {
     param(
-        [string]$SourceFile
+        [Parameter(Mandatory)]
+        $Update
     )
 
-    if (-not $RdpExportEnabled) {
-
-        Write-Log `
-            "RDP network-log export is disabled." `
-            "INFO"
-
-        return
-    }
-
-    if (-not (Test-Path $SourceFile)) {
-
-        Write-Log `
-            "Network log does not exist; RDP export skipped." `
-            "WARN"
-
-        return
-    }
-
-    $rdpRoot = Find-RdpRedirectedPath
-
-    if (-not $rdpRoot) {
-
-        Write-Log `
-            "No available RDP redirected location found. Network log remains local." `
-            "WARN"
-
-        return
-    }
+    # BrowseOnly is the primary WUA indication that an update
+    # is not normally offered as an automatic/required update.
 
     try {
-
-        $exportDirectory = Join-Path `
-            $rdpRoot `
-            "WinPatcher"
-
-        if (-not (Test-Path $exportDirectory)) {
-
-            New-Item `
-                -ItemType Directory `
-                -Path $exportDirectory `
-                -Force | Out-Null
+        if ([bool]$Update.BrowseOnly) {
+            return $true
         }
-
-        $destination = Join-Path `
-            $exportDirectory `
-        (Split-Path $SourceFile -Leaf)
-
-        Copy-Item `
-            -Path $SourceFile `
-            -Destination $destination `
-            -Force
-
-        Write-Log `
-            "Network log exported through the RDP redirected location." `
-            "SUCCESS"
-
-        Write-Host ""
-        Write-Host "RDP export:"
-        Write-Host "     $destination"
-        Write-Host ""
     }
     catch {
-
-        Write-Log `
-            "RDP network-log export failed: $_" `
-            "WARN"
     }
+
+    return $false
 }
 
+function Get-UpdateType {
+    param(
+        [Parameter(Mandatory)]
+        $Update
+    )
 
-function Ensure-WinGet {
+    # Drivers are classified separately before optional status.
 
-    Write-Log "Checking for WinGet..."
-
-    $winget = Get-Command `
-        winget `
-        -ErrorAction SilentlyContinue
-
-    if ($winget) {
-
-        Write-Log `
-            "WinGet detected." `
-            "SUCCESS"
-
-        return
+    if (Test-DriverUpdate $Update) {
+        return "Driver"
     }
 
-    Write-Log `
-        "WinGet missing. Attempting App Installer repair..." `
-        "WARN"
-
-    try {
-
-        $package = Get-AppxPackage `
-            Microsoft.DesktopAppInstaller `
-            -ErrorAction SilentlyContinue
-
-        if ($package) {
-
-            $manifest = Join-Path `
-                $package.InstallLocation `
-                "AppXManifest.xml"
-
-            if (Test-Path $manifest) {
-
-                Write-Log `
-                    "Registering App Installer manifest..." `
-                    "INFO"
-
-                Add-AppxPackage `
-                    -DisableDevelopmentMode `
-                    -Register `
-                    $manifest
-
-                Start-Sleep -Seconds 5
-            }
-        }
-        else {
-
-            Write-Log `
-                "App Installer package not found for current user." `
-                "WARN"
-        }
-
-        $winget = Get-Command `
-            winget `
-            -ErrorAction SilentlyContinue
-
-        if (-not $winget) {
-
-            Write-Log `
-                "Manifest repair did not restore WinGet. Trying family registration fallback..." `
-                "WARN"
-
-            try {
-
-                Add-AppxPackage `
-                    -RegisterByFamilyName `
-                    -MainPackage `
-                    "Microsoft.DesktopAppInstaller_8wekyb3d8bbwe"
-
-                Start-Sleep -Seconds 5
-            }
-            catch {
-
-                Write-Log `
-                    "Family registration fallback failed: $_" `
-                    "WARN"
-            }
-        }
-
-        $winget = Get-Command `
-            winget `
-            -ErrorAction SilentlyContinue
-
-        if (-not $winget) {
-
-            throw "WinGet remains unavailable after App Installer repair attempts."
-        }
-
-        Write-Log `
-            "WinGet repaired successfully." `
-            "SUCCESS"
+    if (Test-OptionalUpdate $Update) {
+        return "Optional"
     }
-    catch {
 
-        Write-Log `
-            "Unable to repair WinGet: $_" `
-            "ERROR"
+    return "Required"
+}
 
-        Write-Host ""
-        Write-Host `
-            "Microsoft App Installer is required for WinGet." `
-            -ForegroundColor Yellow
+# ============================================================
+# REBOOT DETECTION
+# ============================================================
 
-        Write-Host ""
-        Write-Host `
-            "Official Microsoft App Installer page:" `
-            -ForegroundColor Yellow
+function Test-PendingReboot {
+
+    $paths = @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending",
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired"
+    )
+
+    foreach ($path in $paths) {
+
+        if (Test-Path $path) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+# ============================================================
+# AUTOMATIC REBOOT
+# ============================================================
+
+function Start-UpdateReboot {
+
+    Write-Host ""
+
+    Write-WarningMessage `
+        "Windows needs to restart to finish applying updates."
+
+    if (-not $Auto_Reboot) {
+
+        Write-WarningMessage `
+            "Automatic reboot is disabled."
+
+        Write-WarningMessage `
+            "Restart Windows manually when convenient."
+
+        return $false
+    }
+
+    Write-Host ""
+
+    for ($seconds = 15; $seconds -gt 0; $seconds--) {
 
         Write-Host `
-            "https://apps.microsoft.com/detail/9NBLGGH4NNS1" `
+            "`r    Restarting in $seconds seconds... " `
+            -NoNewline `
             -ForegroundColor Yellow
 
-        Write-Host ""
-
-        Wait-AndExit
+        Start-Sleep -Seconds 1
     }
+
+    Write-Host ""
+    Write-Host ""
+
+    Write-WarningMessage "Restarting computer..."
+
+    Restart-Computer -Force
+
+    return $true
 }
 
+# ============================================================
+# HEADER
+# ============================================================
 
-function Update-WinGetSources {
+Clear-Host
 
-    Write-Log "Updating WinGet sources..."
+Write-Host ""
+Write-Host "============================================================" `
+    -ForegroundColor Cyan
 
-    try {
+Write-Host "                  WINDOWS UPDATE" `
+    -ForegroundColor Cyan
 
-        winget source update `
-            --disable-interactivity 2>&1 |
-        Tee-Object `
-            -FilePath $LogFile `
-            -Append
+Write-Host "============================================================" `
+    -ForegroundColor Cyan
 
-        $exitCode = $LASTEXITCODE
+Write-Host ""
 
-        if ($exitCode -eq 0) {
+Write-Info "Computer : $env:COMPUTERNAME"
+Write-Info "Started  : $(Get-Date)"
 
-            Write-Log `
-                "WinGet sources updated successfully." `
-                "SUCCESS"
-        }
-        else {
+if ($Include_Optional) {
 
-            Write-Log `
-                "WinGet source update returned exit code $exitCode." `
-                "WARN"
-        }
-    }
-    catch {
+    Write-Info "Optional : Included"
+}
+else {
 
-        Write-Log `
-            "WinGet source update failed: $_" `
-            "WARN"
-    }
+    Write-Info "Optional : Not selected"
 }
 
+if ($Auto_Reboot) {
 
-function Upgrade-Packages {
+    Write-Info "Reboot   : Automatic when required"
+}
+else {
 
-    Write-Log "Starting package upgrade process..."
-
-    try {
-
-        $upgradeArgs = @(
-            "upgrade"
-            "--all"
-            "--include-unknown"
-            "--accept-source-agreements"
-            "--accept-package-agreements"
-            "--silent"
-            "--disable-interactivity"
-        )
-
-        & winget @upgradeArgs 2>&1 |
-        Tee-Object `
-            -FilePath $LogFile `
-            -Append
-
-        $exitCode = $LASTEXITCODE
-
-        if ($exitCode -eq 0) {
-
-            Write-Log `
-                "Package upgrade process completed successfully." `
-                "SUCCESS"
-        }
-        else {
-
-            Write-Log `
-                "WinGet upgrade returned exit code $exitCode." `
-                "WARN"
-        }
-    }
-    catch {
-
-        Write-Log `
-            "WinGet upgrade process failed: $_" `
-            "ERROR"
-    }
+    Write-Info "Reboot   : Manual"
 }
 
+# ============================================================
+# ADMIN CHECK
+# ============================================================
 
-# =========================================
-# MAIN
-# =========================================
+Write-Step "Checking administrator privileges..."
+
+$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+
+$principal = New-Object Security.Principal.WindowsPrincipal(
+    $identity
+)
+
+if (-not $principal.IsInRole(
+    [Security.Principal.WindowsBuiltInRole]::Administrator
+)) {
+
+    Write-Failure `
+        "This script must be run as Administrator."
+
+    exit 1
+}
+
+Write-Success `
+    "Administrator privileges confirmed."
+
+# ============================================================
+# EXISTING REBOOT CHECK
+# ============================================================
+
+Write-Step "Checking for a pending reboot..."
+
+$existingPendingReboot = Test-PendingReboot
+
+if ($existingPendingReboot) {
+
+    Write-WarningMessage `
+        "Windows currently reports a pending reboot."
+
+    Write-WarningMessage `
+        "The script will not automatically reboot at this stage."
+
+    if ($Auto_Reboot) {
+
+        Write-Info `
+            "Automatic reboot will only occur if the current update operation requires it."
+    }
+}
+else {
+
+    Write-Success "No pending reboot detected."
+}
+
+# ============================================================
+# WINDOWS UPDATE SESSION
+# ============================================================
+
+Write-Step "Connecting to Windows Update..."
 
 try {
 
-    # -------------------------------------
-    # Console initialization
-    # -------------------------------------
+    $session = New-Object -ComObject Microsoft.Update.Session
 
-    Set-ConsoleUI
+    $session.ClientApplicationID = `
+        "PowerShell Windows Updater"
 
-    Show-Banner
+    $searcher = $session.CreateUpdateSearcher()
 
-    do {
-
-        $key = $Host.UI.RawUI.ReadKey(
-            "NoEcho,IncludeKeyDown"
-        )
-
-    } until ($key.VirtualKeyCode -eq 13)
-
-    Clear-Host
-
-
-    # -------------------------------------
-    # Administrator elevation
-    # -------------------------------------
-
-    Ensure-Administrator
-
-
-    # -------------------------------------
-    # Create directories
-    # -------------------------------------
-
-    if (-not (Test-Path $LogDirectory)) {
-
-        New-Item `
-            -ItemType Directory `
-            -Path $LogDirectory `
-            -Force | Out-Null
-    }
-
-    if (-not (Test-Path $NetworkLogDirectory)) {
-
-        New-Item `
-            -ItemType Directory `
-            -Path $NetworkLogDirectory `
-            -Force | Out-Null
-    }
-
-
-    # -------------------------------------
-    # Start transcript
-    # -------------------------------------
-
-    try {
-
-        Start-Transcript `
-            -Path $TranscriptFile `
-            -ErrorAction Stop |
-        Out-Null
-
-        $transcriptStarted = $true
-    }
-    catch {
-
-        $transcriptStarted = $false
-
-        Write-Host `
-            "[WARNING] Unable to start transcript: $($_.Exception.Message)" `
-            -ForegroundColor Yellow
-    }
-
-
-    # -------------------------------------
-    # Initialize log
-    # -------------------------------------
-
-    Write-Log "========================================="
-    Write-Log "WinPatcher v2.4 starting."
-    Write-Log "Computer: $env:COMPUTERNAME"
-    Write-Log "User: $env:USERNAME"
-    Write-Log "========================================="
-
-
-    # -------------------------------------
-    # Windows version
-    # -------------------------------------
-
-    $windowsVersion = Get-WindowsVersion
-
-    Write-Log `
-        "Detected OS: $windowsVersion"
-
-
-    # -------------------------------------
-    # Network configuration
-    # -------------------------------------
-
-    Write-Host ""
-    Write-Host "[+] Capturing Network Configuration..."
-
-    $networkCaptureSuccessful = `
-        Capture-NetworkConfiguration
-
-    if ($networkCaptureSuccessful) {
-
-        Write-Host ""
-        Write-Host "[OK] Network log saved to:"
-        Write-Host "     $NetworkLogFile"
-        Write-Host ""
-    }
-
-
-    # -------------------------------------
-    # Optional RDP export
-    # -------------------------------------
-
-    Export-NetworkLogToRdp `
-        -SourceFile $NetworkLogFile
-
-
-    # -------------------------------------
-    # Uptime check
-    # -------------------------------------
-
-    Check-Uptime
-
-
-    # -------------------------------------
-    # Pending reboot check
-    # -------------------------------------
-
-    Test-PendingReboot
-
-
-    # -------------------------------------
-    # WinGet
-    # -------------------------------------
-
-    Ensure-WinGet
-
-    Write-Host ""
-
-
-    # -------------------------------------
-    # Update WinGet sources
-    # -------------------------------------
-
-    Update-WinGetSources
-
-    Write-Host ""
-
-
-    # -------------------------------------
-    # Upgrade packages
-    # -------------------------------------
-
-    Write-Host "[+] Running winget upgrade..."
-    Write-Host ""
-
-    Upgrade-Packages
-
-
-    # -------------------------------------
-    # Completion
-    # -------------------------------------
-
-    Write-Host ""
-    Write-Host "========================================" `
-        -ForegroundColor Green
-
-    Write-Host "         Patch process complete         " `
-        -ForegroundColor Green
-
-    Write-Host "========================================" `
-        -ForegroundColor Green
-
-    Write-Host ""
-
-    Write-Log `
-        "Patch process completed." `
-        "SUCCESS"
-
-    Write-Host "Log file saved to:"
-    Write-Host $LogFile
-
-    Write-Host ""
-    Write-Host "Network log saved to:"
-    Write-Host $NetworkLogFile
-
-    Write-Host ""
-
+    $searcher.Online = $true
 }
 catch {
 
-    Write-Host ""
-    Write-Host "========================================" `
-        -ForegroundColor Red
+    Write-Failure `
+        "Could not initialize Windows Update."
 
-    Write-Host "             FATAL ERROR                " `
-        -ForegroundColor Red
+    Write-Failure $_.Exception.Message
 
-    Write-Host "========================================" `
-        -ForegroundColor Red
+    exit 2
+}
+
+Write-Success `
+    "Windows Update Agent initialized."
+
+# ============================================================
+# SEARCH
+# ============================================================
+
+Write-Step "Searching Windows Update..."
+
+Write-Info "Online search: enabled"
+Write-Info "Hidden updates: excluded"
+Write-Info "Installed updates: excluded"
+
+Write-Host ""
+
+$searchStart = Get-Date
+
+try {
+
+    $searchResult = $searcher.Search(
+        "IsInstalled=0 and IsHidden=0"
+    )
+}
+catch {
+
+    Write-Failure `
+        "Windows Update search failed."
+
+    Write-Failure $_.Exception.Message
+
+    exit 3
+}
+
+$searchSeconds = [math]::Round(
+    ((Get-Date) - $searchStart).TotalSeconds,
+    1
+)
+
+$allUpdates = $searchResult.Updates
+
+Write-Success "Search completed."
+
+Write-Info `
+    "Search time: $searchSeconds seconds"
+
+Write-Info `
+    "Updates found: $($allUpdates.Count)"
+
+# ============================================================
+# CATEGORIZE UPDATES
+# ============================================================
+
+Write-Step "Categorizing updates..."
+
+$requiredUpdates = `
+    New-Object -ComObject Microsoft.Update.UpdateColl
+
+$optionalUpdates = `
+    New-Object -ComObject Microsoft.Update.UpdateColl
+
+$driverUpdates = `
+    New-Object -ComObject Microsoft.Update.UpdateColl
+
+foreach ($update in $allUpdates) {
+
+    $type = Get-UpdateType $update
+
+    switch ($type) {
+
+        "Driver" {
+            [void]$driverUpdates.Add($update)
+        }
+
+        "Optional" {
+            [void]$optionalUpdates.Add($update)
+        }
+
+        default {
+            [void]$requiredUpdates.Add($update)
+        }
+    }
+}
+
+Write-Success "Categorization complete."
+
+# ============================================================
+# DISPLAY REQUIRED
+# ============================================================
+
+Write-Host ""
+Write-Host "WINDOWS UPDATE" -ForegroundColor White
+
+Write-Host "------------------------------------------------------------" `
+    -ForegroundColor DarkGray
+
+Write-Host ""
+Write-Host "Required Updates" -ForegroundColor Cyan
+
+if ($requiredUpdates.Count -eq 0) {
+
+    Write-Host "  None" -ForegroundColor DarkGray
+}
+else {
+
+    for (
+        $i = 0;
+        $i -lt $requiredUpdates.Count;
+        $i++
+    ) {
+
+        $update = $requiredUpdates.Item($i)
+
+        Write-UpdateEntry $update
+    }
+}
+
+# ============================================================
+# DISPLAY OPTIONAL
+# ============================================================
+
+Write-Host ""
+Write-Host "Optional Updates" -ForegroundColor Cyan
+
+if ($optionalUpdates.Count -eq 0) {
+
+    Write-Host "  None" -ForegroundColor DarkGray
+}
+else {
+
+    for (
+        $i = 0;
+        $i -lt $optionalUpdates.Count;
+        $i++
+    ) {
+
+        $update = $optionalUpdates.Item($i)
+
+        Write-UpdateEntry $update
+    }
+}
+
+# ============================================================
+# DISPLAY DRIVERS
+# ============================================================
+
+Write-Host ""
+Write-Host "Drivers" -ForegroundColor Cyan
+
+if ($driverUpdates.Count -eq 0) {
+
+    Write-Host "  None" -ForegroundColor DarkGray
+}
+else {
+
+    for (
+        $i = 0;
+        $i -lt $driverUpdates.Count;
+        $i++
+    ) {
+
+        $update = $driverUpdates.Item($i)
+
+        Write-UpdateEntry $update
+    }
+}
+
+# ============================================================
+# SUMMARY
+# ============================================================
+
+Write-Host ""
+Write-Host "Available Updates:" -ForegroundColor Cyan
+
+Write-Host "  Required:         $($requiredUpdates.Count)"
+Write-Host "  Optional:         $($optionalUpdates.Count)"
+Write-Host "  Drivers:          $($driverUpdates.Count)"
+
+# ============================================================
+# NOTHING FOUND
+# ============================================================
+
+if (
+    $requiredUpdates.Count -eq 0 -and
+    $optionalUpdates.Count -eq 0 -and
+    $driverUpdates.Count -eq 0
+) {
 
     Write-Host ""
 
     Write-Host `
-        $_.Exception.Message `
-        -ForegroundColor Red
+        "============================================================" `
+        -ForegroundColor Green
+
+    Write-Host `
+        "                WINDOWS IS UP TO DATE" `
+        -ForegroundColor Green
+
+    Write-Host `
+        "============================================================" `
+        -ForegroundColor Green
+
+    Write-Host ""
+
+    exit 0
+}
+
+# ============================================================
+# BUILD INSTALLATION LIST
+# ============================================================
+
+$updatesToInstall = `
+    New-Object -ComObject Microsoft.Update.UpdateColl
+
+# Required updates are always selected.
+
+foreach ($update in $requiredUpdates) {
+
+    [void]$updatesToInstall.Add($update)
+}
+
+# Optional updates and drivers require -Include-Optional.
+
+if ($Include_Optional) {
+
+    foreach ($update in $optionalUpdates) {
+
+        [void]$updatesToInstall.Add($update)
+    }
+
+    foreach ($update in $driverUpdates) {
+
+        [void]$updatesToInstall.Add($update)
+    }
+}
+
+Write-Host ""
+
+Write-Host `
+    "Selected for installation: $($updatesToInstall.Count)" `
+    -ForegroundColor Cyan
+
+if (-not $Include_Optional) {
+
+    Write-Info `
+        "Optional updates and drivers are displayed but not selected."
+
+    Write-Info `
+        "Use -Include-Optional to install them."
+}
+
+# ============================================================
+# NOTHING SELECTED
+# ============================================================
+
+if ($updatesToInstall.Count -eq 0) {
+
+    Write-Host ""
+
+    Write-WarningMessage `
+        "No updates are selected for installation."
+
+    Write-Info `
+        "Use -Include-Optional if you want to install optional updates and drivers."
+
+    exit 0
+}
+
+# ============================================================
+# CONFIRMATION
+# ============================================================
+
+Write-Host ""
+
+Write-Host `
+    "Install selected updates? [Y/N] " `
+    -NoNewline `
+    -ForegroundColor Yellow
+
+$answer = Read-Host
+
+if ($answer -notmatch "^[Yy]$") {
+
+    Write-Host ""
+
+    Write-WarningMessage `
+        "Installation cancelled by user."
+
+    exit 10
+}
+
+# ============================================================
+# DOWNLOAD PREPARATION
+# ============================================================
+
+Write-Step "Preparing updates..."
+
+$updatesNeedingEula = 0
+
+foreach ($update in $updatesToInstall) {
 
     try {
 
-        Write-Log `
-            "Fatal error: $($_.Exception.Message)" `
-            "ERROR"
+        if (-not $update.EulaAccepted) {
+
+            Write-WarningMessage `
+                "EULA not yet accepted:"
+
+            Write-Info $update.Title
+
+            Write-Info `
+                "Windows Update will handle EULA requirements during installation."
+
+            $updatesNeedingEula++
+        }
     }
     catch {
-        # Logging failure should not hide original error.
-    }
-}
-finally {
-
-    if ($transcriptStarted) {
-
-        try {
-
-            Stop-Transcript |
-            Out-Null
-        }
-        catch {
-            # Transcript may already have stopped.
-        }
+        # Some updates may not expose EulaAccepted.
     }
 }
 
-Wait-AndExit
+if ($updatesNeedingEula -gt 0) {
+
+    Write-Info `
+        "$updatesNeedingEula update(s) report an unaccepted EULA."
+}
+
+Write-Success "Updates prepared."
+
+# ============================================================
+# DOWNLOAD
+# ============================================================
+
+Write-Step "Downloading updates..."
+
+Write-Info `
+    "Updates selected: $($updatesToInstall.Count)"
+
+Write-Info `
+    "Windows Update is downloading the required files."
+
+$downloader = $session.CreateUpdateDownloader()
+
+$downloader.Updates = $updatesToInstall
+
+$downloadStart = Get-Date
+
+try {
+
+    $downloadResult = $downloader.Download()
+}
+catch {
+
+    Write-Failure `
+        "Download operation failed."
+
+    Write-Failure $_.Exception.Message
+
+    exit 20
+}
+
+$downloadSeconds = [math]::Round(
+    ((Get-Date) - $downloadStart).TotalSeconds,
+    1
+)
+
+Write-Success `
+    "Download operation completed."
+
+Write-Info `
+    "Download time: $downloadSeconds seconds"
+
+Write-Info `
+    "Result code: $($downloadResult.ResultCode)"
+
+# ============================================================
+# CHECK DOWNLOADS
+# ============================================================
+
+Write-Step "Checking downloaded updates..."
+
+$installCollection = `
+    New-Object -ComObject Microsoft.Update.UpdateColl
+
+$downloadFailures = 0
+
+foreach ($update in $updatesToInstall) {
+
+    if ($update.IsDownloaded) {
+
+        [void]$installCollection.Add($update)
+
+        Write-Success `
+            "Ready: $($update.Title)"
+    }
+    else {
+
+        Write-Failure `
+            "Download failed: $($update.Title)"
+
+        $downloadFailures++
+    }
+}
+
+Write-Host ""
+
+Write-Info `
+    "Ready to install: $($installCollection.Count)"
+
+Write-Info `
+    "Download failures: $downloadFailures"
+
+if ($installCollection.Count -eq 0) {
+
+    Write-Failure `
+        "No selected updates were successfully downloaded."
+
+    exit 21
+}
+
+# ============================================================
+# INSTALLATION SETUP
+# ============================================================
+
+Write-Step `
+    "Checking installation requirements..."
+
+$installer = $session.CreateUpdateInstaller()
+
+$installer.Updates = $installCollection
+
+try {
+
+    if ($installer.RebootRequiredBeforeInstallation) {
+
+        Write-WarningMessage `
+            "Windows requires a reboot before installation."
+
+        if ($Auto_Reboot) {
+
+            Write-WarningMessage `
+                "Automatic reboot is enabled."
+
+            Write-WarningMessage `
+                "Restarting now..."
+
+            Restart-Computer -Force
+
+            exit 3010
+        }
+
+        Write-Failure `
+            "Installation cannot continue until Windows is restarted."
+
+        Write-WarningMessage `
+            "Restart Windows and run this script again."
+
+        exit 3010
+    }
+}
+catch {
+
+    Write-WarningMessage `
+        "Could not determine pre-install reboot state."
+
+    Write-WarningMessage `
+        "Continuing with installation."
+}
+
+# ============================================================
+# INSTALL
+# ============================================================
+
+Write-Step "Installing Windows Updates..."
+
+Write-Info `
+    "Updates to install: $($installCollection.Count)"
+
+Write-Info `
+    "This may take several minutes."
+
+$installStart = Get-Date
+
+try {
+
+    $installResult = $installer.Install()
+}
+catch {
+
+    Write-Failure `
+        "Windows Update installation failed."
+
+    Write-Failure $_.Exception.Message
+
+    exit 30
+}
+
+$installSeconds = [math]::Round(
+    ((Get-Date) - $installStart).TotalSeconds,
+    1
+)
+
+# ============================================================
+# INDIVIDUAL RESULTS
+# ============================================================
+
+Write-Step "Installation Results"
+
+$installedSuccessfully = 0
+$installedWithErrors = 0
+$failed = 0
+$unknown = 0
+
+for (
+    $i = 0;
+    $i -lt $installCollection.Count;
+    $i++
+) {
+
+    $update = $installCollection.Item($i)
+
+    $result = $installResult.GetUpdateResult($i)
+
+    Write-Host ""
+
+    Write-Host `
+        "  [$($i + 1)/$($installCollection.Count)]" `
+        -ForegroundColor Yellow
+
+    Write-Host `
+        "  $($update.Title)" `
+        -ForegroundColor White
+
+    Write-Info `
+        "Result code: $($result.ResultCode)"
+
+    Write-Info `
+        "HRESULT:     $($result.HResult)"
+
+    switch ([int]$result.ResultCode) {
+
+        # 2 = Succeeded
+        2 {
+
+            Write-Success `
+                "Installed successfully."
+
+            $installedSuccessfully++
+        }
+
+        # 3 = Succeeded with errors
+        3 {
+
+            Write-WarningMessage `
+                "Installed with errors."
+
+            $installedWithErrors++
+        }
+
+        # 4 = Failed
+        4 {
+
+            Write-Failure `
+                "Installation failed."
+
+            $failed++
+        }
+
+        # 5 = Aborted
+        5 {
+
+            Write-Failure `
+                "Installation aborted."
+
+            $failed++
+        }
+
+        default {
+
+            Write-WarningMessage `
+                "Unknown installation result."
+
+            $unknown++
+        }
+    }
+}
+
+# ============================================================
+# REBOOT STATUS
+# ============================================================
+
+Write-Step "Checking final reboot status..."
+
+$rebootRequired = $false
+
+try {
+
+    $rebootRequired = `
+        [bool]$installResult.RebootRequired
+}
+catch {
+
+    $rebootRequired = Test-PendingReboot
+}
+
+# Check system state as a fallback.
+
+if (-not $rebootRequired) {
+
+    $rebootRequired = Test-PendingReboot
+}
+
+# ============================================================
+# FINAL SUMMARY
+# ============================================================
+
+Write-Host ""
+
+Write-Host `
+    "============================================================" `
+    -ForegroundColor Cyan
+
+Write-Host `
+    "                    UPDATE SUMMARY" `
+    -ForegroundColor Cyan
+
+Write-Host `
+    "============================================================" `
+    -ForegroundColor Cyan
+
+Write-Host ""
+
+Write-Info `
+    "Installation time     : $installSeconds seconds"
+
+Write-Info `
+    "Installed successfully: $installedSuccessfully"
+
+Write-Info `
+    "Installed with errors : $installedWithErrors"
+
+Write-Info `
+    "Failed                : $failed"
+
+Write-Info `
+    "Unknown               : $unknown"
+
+Write-Info `
+    "Download failures     : $downloadFailures"
+
+if ($existingPendingReboot) {
+
+    Write-Host ""
+
+    Write-WarningMessage `
+        "A reboot was already pending before this script ran."
+}
+
+if ($rebootRequired) {
+
+    Write-Host ""
+
+    Write-Host `
+        "    *** REBOOT REQUIRED ***" `
+        -ForegroundColor Yellow
+
+    Write-WarningMessage `
+        "Windows must restart to finish applying updates."
+}
+else {
+
+    Write-Host ""
+
+    Write-Success `
+        "No reboot is required."
+}
+
+# ============================================================
+# FAILURE HANDLING
+# ============================================================
+
+if (
+    $failed -gt 0 -or
+    $downloadFailures -gt 0 -or
+    $unknown -gt 0
+) {
+
+    Write-Host ""
+
+    Write-Failure `
+        "Windows Update completed with errors."
+
+    if ($installedWithErrors -gt 0) {
+
+        Write-WarningMessage `
+            "$installedWithErrors update(s) installed with errors."
+    }
+
+    if ($rebootRequired -and $Auto_Reboot) {
+
+        Start-UpdateReboot | Out-Null
+    }
+
+    exit 40
+}
+
+# ============================================================
+# INSTALLATION-WITH-ERRORS HANDLING
+# ============================================================
+
+if ($installedWithErrors -gt 0) {
+
+    Write-Host ""
+
+    Write-WarningMessage `
+        "All selected updates completed, but one or more reported errors."
+
+    if ($rebootRequired) {
+
+        if ($Auto_Reboot) {
+
+            Start-UpdateReboot | Out-Null
+
+            exit 3010
+        }
+
+        Write-WarningMessage `
+            "Automatic reboot is disabled."
+
+        Write-WarningMessage `
+            "Restart Windows manually when convenient."
+
+        exit 3010
+    }
+
+    exit 40
+}
+
+# ============================================================
+# REBOOT HANDLING
+# ============================================================
+
+if ($rebootRequired) {
+
+    if ($Auto_Reboot) {
+
+        Start-UpdateReboot | Out-Null
+
+        exit 3010
+    }
+
+    Write-Host ""
+
+    Write-WarningMessage `
+        "Automatic reboot is disabled."
+
+    Write-WarningMessage `
+        "Restart Windows manually when convenient."
+
+    exit 3010
+}
+
+# ============================================================
+# SUCCESS
+# ============================================================
+
+Write-Host ""
+
+Write-Host `
+    "============================================================" `
+    -ForegroundColor Green
+
+Write-Host `
+    "              WINDOWS UPDATE COMPLETE" `
+    -ForegroundColor Green
+
+Write-Host `
+    "============================================================" `
+    -ForegroundColor Green
+
+Write-Host ""
+
+Write-Success `
+    "All selected updates completed successfully."
+
+exit 0
