@@ -68,3 +68,49 @@ The default recommended maximum uptime is:
 
 ```text
 12 hours
+
+
+
+
+
+
+
+
+
+Windows Update 2.2
+Added
+
+Added automatic UAC elevation when the script is launched without Administrator privileges.
+
+Added automatic relaunch of the script in an elevated PowerShell process.
+
+Preserved -Include_Optional and -Auto_Reboot arguments during elevation.
+
+Added handling for cancelled or failed UAC elevation.
+
+Changed
+
+Removed #requires -RunAsAdministrator in favor of self-elevation.
+
+The original non-administrator PowerShell process now exits after launching the elevated process.
+
+Added an additional administrator verification after elevation.
+
+Updated startup information to indicate the script is running elevated.
+
+Maintained existing Windows Update, download, installation, reboot, and exit-code behavior.
+
+Default Behavior
+
+Running the script without flags installs required updates only.
+
+Optional updates and drivers require -Include_Optional.
+
+Automatic reboot requires -Auto_Reboot.
+
+Existing pending reboots do not automatically trigger a reboot before the update search.
+
+Usage
+.\Windows_Update_2.2.ps1
+.\Windows_Update_2.2.ps1 -Include_Optional
+.\Windows_Update_2.2.ps1 -Include_Optional -Auto_Reboot
