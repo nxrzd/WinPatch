@@ -1,78 +1,82 @@
 # WinPatch
 
-**WinPatch v2.4** is a PowerShell-based Windows maintenance utility that performs system checks, repairs and updates WinGet when necessary, refreshes WinGet sources, upgrades installed packages, and installs Windows Updates.
+WinPatch (WinPatcher v2.4) is a PowerShell utility for Windows diagnostics and application maintenance through Microsoft's WinGet package manager.
 
-WinPatch also creates diagnostic logs, captures a timestamped network configuration snapshot, and can optionally copy that snapshot to an **RDP-redirected folder** on the administrator's local computer.
+## Features
 
----
-
-## Overview
-
-WinPatch is designed for Windows maintenance and package management using Microsoft's **WinGet** package manager and the Windows Update Agent.
-
-Before and during maintenance operations, WinPatch can:
-
-- Verify administrator privileges
-- Automatically request Administrator elevation through Windows UAC
-- Relaunch itself in an elevated PowerShell window when required
-- Detect the Windows version
-- Check system uptime
-- Detect a pending Windows reboot
-- Capture a network configuration snapshot
-- Verify and repair WinGet
-- Update WinGet package sources
-- Upgrade installed packages
-- Search Windows Update
-- Display required, optional, and driver updates
-- Install required Windows Updates
-- Optionally install optional updates and drivers
-- Optionally restart Windows when an update requires a reboot
-- Save structured logs and a PowerShell transcript
-- Optionally export the network snapshot through an RDP-redirected drive
-
-> **Important:** WinPatch requires **Windows PowerShell 5.1 or newer**.
-
-> **Note:** Administrator privileges are required for maintenance operations. WinPatch can automatically request elevation through Windows UAC, so you do not need to manually open an elevated PowerShell window.
-
-> **Note:** Windows Terminal is **not required**. WinPatch runs directly through Windows PowerShell.
-
----
+- Requests administrator privileges through Windows UAC.
+- Detects the Windows version and checks system uptime.
+- Reports pending reboot indicators.
+- Captures a timestamped network configuration snapshot.
+- Detects WinGet and attempts to repair its App Installer registration when necessary.
+- Refreshes WinGet sources and upgrades installed application packages.
+- Writes application logs and a PowerShell transcript.
+- Exports the network snapshot to an available RDP-redirected drive when enabled.
 
 ## Requirements
 
-- Windows 10 or Windows 11
-- Windows PowerShell 5.1+
-- Administrator privileges
-- Microsoft App Installer / WinGet
-- An active internet connection for package and source updates
-- Optional: an RDP session with a redirected drive if RDP export is desired
+- Windows 10 or Windows 11.
+- Windows PowerShell 5.1 or later.
+- Administrator access for maintenance operations.
+- Microsoft App Installer / WinGet.
+- Internet access for package source refreshes and upgrades.
 
-WinPatch will automatically request Administrator elevation if it is launched from a non-elevated PowerShell session.
+Windows Terminal is not required. If WinGet cannot be restored, the script displays the official Microsoft App Installer page.
 
-The original non-administrator PowerShell process exits after successfully launching the elevated copy.
+## Usage
 
-If WinGet is missing, WinPatch will attempt to repair it.
-
-If Microsoft App Installer is not installed at all, WinPatch will provide the official Microsoft App Installer location rather than silently downloading an external installer.
-
----
-
-## Administrator Elevation
-
-WinPatch includes built-in UAC self-elevation.
-
-When the script is launched without Administrator privileges, it:
-
-1. Detects that the current PowerShell process is not elevated.
-2. Requests Administrator access through Windows UAC.
-3. Launches an elevated copy of the same script.
-4. Preserves any command-line options supplied to the original script.
-5. Closes the original non-administrator PowerShell process.
-6. Continues execution in the elevated PowerShell process.
-
-This means WinPatch can be started normally without manually selecting **Run as administrator**.
-
-For example:
+Save the script as `WinPatcher.ps1`, open Windows PowerShell in its directory, and run:
 
 ```powershell
-.\WinPatch.ps1
+.\WinPatcher.ps1
+```
+
+Press **Enter** at the startup banner. If the session is not elevated, the script requests UAC elevation and relaunches itself.
+
+The maintenance sequence captures network diagnostics, checks uptime and reboot state, verifies WinGet, refreshes package sources, and upgrades applications.
+
+Application upgrades use `winget upgrade --all --include-unknown` with silent installation, agreement acceptance, and interactivity disabled. Review this behavior before running the script on a managed computer.
+
+## Configuration
+
+Edit these values near the top of `WinPatcher.ps1`:
+
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `$MaxRecommendedUptimeHours` | `12` | Uptime threshold for a warning. |
+| `$RdpExportEnabled` | `$true` | Enables network snapshot export when a redirected drive is available. |
+| `$RdpExportPath` | `""` | Automatically discovers an RDP destination; set an explicit path to choose one. |
+
+To retain network snapshots only on the computer running the script:
+
+```powershell
+$RdpExportEnabled = $false
+```
+
+An explicit RDP export destination must already be available to the session, for example `\\tsclient\C\WinPatcher`.
+
+## Logs
+
+Application logs and transcripts are stored in:
+
+```text
+%ProgramData%\WinPatcher\
+```
+
+Network snapshots are stored in:
+
+```text
+%ProgramData%\WinPatcher\NetworkLogs\
+```
+
+Filenames include timestamps. RDP export copies the network snapshot; application logs and transcripts remain local.
+
+## Separate Windows Update project
+
+The standalone Windows Update installer is a separate tool. It searches, downloads, and installs operating system updates and drivers through the Windows Update Agent.
+
+Its `-Include_Optional` and `-Auto_Reboot` switches belong to that installer. They are not parameters of the WinGet maintenance script documented here.
+
+## License
+
+The recovered script identifies its license as MIT. See the repository's license file for the full terms.
